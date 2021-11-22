@@ -3,8 +3,29 @@
 // Author      : Peter Che
 // Version     :
 // Copyright   : Peter Che 7210208@gmail.com
-// Description : Hello World in C++, Ansi-style
+// Description : Pet Project in C
 //============================================================================
+
+/*
+ * программа должна делать следующее
+ * 1. Запускается несколько потоков для обработки
+ * 2. Каждый поток ждет соединения и получает FastCGI данные с помощью библиотеки
+ * 3. Каждый поток парсит заголовки
+ *    и либо получает и сохраняет файл из потока FastCGI,
+ *    либо забирает сохраненный файл картинки с диска.
+ * 4. Получив файл-картинку поток вызывает для обработки
+ *    OpenCV.
+ * 5. Считывает картинку себе в память. Если большая, то resize
+ * 6. если нажата одна из кнопок "нравится"/"отказать", то получает
+ *    из запроса старые значения обработки и сохраняет ответ в файл.
+ * 7.   Случайным образом (тоже вариант ) генерит новые параметры
+ * 8. поток расчитывает параметры remap (три варианта)
+ * 9. поочередно применяет все три remap и получает выходную картинку
+ * 10. выходную картинку сохраняет на диск и с помощью scp отправляет на сервер 10.0.1.1 (FreeBSD)
+ * 11. создает соответствующую  HTML страницу и отправляет её
+ *     на внешний сервер
+ * 12. Записывает в журнал параметры обработки, имя файла, время обработки.
+ */
 
 #include <errno.h>
 
@@ -24,7 +45,6 @@
 #include "opencv2/imgproc.hpp"
 #include "opencv2/imgcodecs.hpp"
 #include "opencv2/core/mat.hpp"
-//#include <opencv2/opencv.hpp>
 
 #include <openssl/sha.h>
 
@@ -32,20 +52,29 @@ using namespace cv;
 using namespace std;
 
 // определяем длину разных буферов
-// для имени файла, для и мени с путем,
-// для одной записи в журнал
+// для имени файла, для имени и пути,
+// для одной записи в журнал. Т.е. вся инфо для журнала заносится в переменную
+// и только после выполнения всех операций заносится в журнал
+//
+// debug и log это разные операции
+// отладку нужно вкоде испоотзовать с инструкциями препроцессора
+//
 #define BUFLEN_F NAME_MAX + 1024
 #define BUFLEN_TXT PATH_MAX + NAME_MAX
 #define LOG_TXT_LEN PATH_MAX + NAME_MAX + 1024
 #define THREAD_COUNT 4 					// количество потоков.
 
-// адрес внешнего сервера вне
+// адрес внешнего сервера.
 #define FRONT_ADDR "107.189.8.250"
 // внутренний адрес
 // лучше конечно вынести их в параметры для этой программы
+// будет лучше и  наглядней
 #define SOCKET_PATH "192.168.0.66:8888"
 
 // условные названия ошибок
+// лучше избегать констант типа ошибка номер "9" в коде
+// лучше дефайнить
+//
 #define ERROR_OPEN_TEMP_FILE 1 			//Error open temporary data file
 #define ERROR_ACCEPT_NEW_REQUEST 2 		//Error accept new request
 #define ERROR_IMAGE_ZERO_DIMENSION 3
@@ -67,9 +96,12 @@ using namespace std;
 #define ERROR_TRANFER_RES_FILE 104
 #define ERROR_FASTCGI_SEND 105
 #define ERROR_ 105
+
 #define SALT_LEN 3
 
-
+// количество параметров обработки изображений
+// в этои варианте все 12 не используются
+//
 #define PARAMETERS_NUM 12
 
 #define MAX_IMAGE_ROWS 512
@@ -102,6 +134,8 @@ using namespace std;
 //хранит дескриптор открытого сокета
 static int socketId;
 // наличие нескольких потоков требует всегда внимания
+// и мьютексы позволят избежать одновременного использования
+//  общих данных в разных потоках
 static pthread_mutex_t accept_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -111,6 +145,8 @@ FILE *marks_file;
 // вспомогательный код
 //возвращает или 1 или 0 или -1
 // с равной вероятностью
+// для выбора параметров обработки
+// если всё по нулям, то вернется исходная картинка
 float rand_101(void) {
 	float ret = float(rand() % 6);
 	if (ret < 2.)
@@ -121,6 +157,8 @@ float rand_101(void) {
 }
 
 // кодирование строки. Следующая программа делает обратное преобразование
+// кодировка base64 не годится для пребразования в HTML код и обратно
+// а base58, как часть библитеки биткойн, не смог запустить ((
 void char2hex(char *hex, char *src, size_t src_len) {
 	size_t i;
 	uchar t;
@@ -143,6 +181,7 @@ void hex2char(const char *hex, char *src, size_t src_len) {
 static void* do_thread(void *thread_num) {
 
 // переменная для хранения кода ошибки
+// коды ошибок в дефайнах
 	int error_idx;
 // переменная для хранения кода возврата разных функций
 	int ret;
@@ -269,7 +308,7 @@ static void* do_thread(void *thread_num) {
 					"fcgi.bin");
 // открываем временный файл в имени которого номер потока
 // многопоточность это очень важно и это нужно всегда учитывать
-// хоть и не всего есть уверенность
+// хоть и не всегда есть уверенность в правильности
 //
 // временный файл открываем до начала открытия сокета
 // так задумано, что бы вынести дорогую операцию создания файла вне цикла обработки
@@ -277,23 +316,29 @@ static void* do_thread(void *thread_num) {
 			if (tmp_fd < 3) {
 				sprintf(log_txt + strlen(log_txt), "\t%s %s.\n",
 						"Error open temporary data file", tmp_file_name);
-//	если не смогли открыть рабочий файл, значит система больна
+// если не смогли открыть рабочий файл, значит система больна
 // и нет возможности принимать данные через сокет
+// и нет смысла ждать соединение
 				error_idx = ERROR_OPEN_TEMP_FILE;
 				continue;
 			}
+// заполняем переменную журнала информацией
 			sprintf(log_txt + strlen(log_txt),
 					"\tdata file %s opened\n\tTry to accept new request\n",
 					tmp_file_name);
 
-//попробовать получить новый запрос
-//
+// попробуем получить FastCGI запрос
+// на обработку.
+// Другие потоки ждут освобождения
+// как только этот поток получит соединение
+// то следующий по очереди поток становится в ожидание соединения
 			pthread_mutex_lock(&accept_mutex);
 			ret = FCGX_Accept_r(&request);
 			pthread_mutex_unlock(&accept_mutex);
 
 			if (ret < 0) {
-//ошибка при получении запроса
+// ошибка при получении запроса
+// продолжаем цикл
 				fprintf(log_file, " thread %d. Error accept new request\n",
 						thread_idx);
 				fflush(log_file);
@@ -301,8 +346,8 @@ static void* do_thread(void *thread_num) {
 				continue;
 			}
 // получили через сокет запрос FastCGI
-// сохраняеи параметры запроса и определяем
-// содержит файл или это ответ на вопрос
+// сохраняем параметры запроса и определяем
+// содержит ли запрос файл или это только ответ на вопрос
 			server_name = FCGX_GetParam("SERVER_NAME", request.envp);
 			content_type = FCGX_GetParam("CONTENT_TYPE", request.envp);
 			ch_content_len = FCGX_GetParam("CONTENT_LENGTH", request.envp);
@@ -324,6 +369,8 @@ static void* do_thread(void *thread_num) {
 			}
 
 // далее обработка запроса содержащего вложение
+// т.е. запрос содержит не нулевой длины вложение
+// и его нужно распарсить и извлечь файл
 			if (content_len != 0) {
 // определяем разделитель. Это достаточно случайный текст, который служит разделителем
 // в теле запроса
@@ -331,6 +378,9 @@ static void* do_thread(void *thread_num) {
 						+ strlen("boundary=");
 				if ((content_len <= 100) or (content_len >= 10000000)) {
 // если содержимое мало или велико, то ничего не делаем и начинаем новый цикл
+// размер выбран произвольно и вот таких констант в цифровом в коде
+// быть не должно и если будете адаптировать себе,
+// то обязательно поменяйте
 					error_idx = REQUEST_CONTENTLENGHT_ERROR;
 					continue;
 				}
@@ -340,18 +390,21 @@ static void* do_thread(void *thread_num) {
 					error_idx = REQUEST_GETSTR_ERROR;
 					break;
 				}
+// ищем boundary в запросе. Вся инфо после него
 				if ((buf_start = strcasestr(buffer, boundary)) == NULL) {
 					error_idx = REQUEST_BOUNDARY_ERROR;
 					break;
 				}
 				buf_start += strlen(boundary);
 
-// ищем слово "filename" в запросе
+// ищем слово "filename=" в запросе
 				if ((buf_current = strcasestr(buf_start, "filename=")) == NULL) {
 					error_idx = REQUEST_FILENAME_NOTFOUND;
 					break;
 				}
 				buf_current += strlen("filename=");
+// теперь buf_current указывает на первый байт после "filename="
+// и надеемся, что это имя файла
 				if (*(buf_current++) != '"')
 // название файла в кавычках. Это открывающая
 						{
@@ -359,12 +412,18 @@ static void* do_thread(void *thread_num) {
 					break;
 				}
 // поиск закрывающей кавычки до конца buffer
+// то, что в кавычках после "filename=" и есть имя файла во вложении
 				buf_end = (char*) memchr(buf_current, '"',
 						batchRW - 2 * strlen(boundary));
 				bzero(file_name, NAME_MAX);
+// проверяем имя файла на длину
+// т.к. далее к имени файла будем приписывать 3 байта номер потока и соль,
+// то файлы с очень длинным именем не обрабатываем
+// можно сохранить имя файла в таблицу и там же сопоставить имя файла внутри
+// и хранить под этим имененм
+// но это еще много кода и новая сущность
 				if (buf_end - buf_current
-						>= (int) (NAME_MAX
-								- PARAMETERS_NUM * sizeof(param[ANGLE_1]))
+						>= (int) (NAME_MAX - SALT_LEN - 3)
 						or buf_end - buf_current <= 4) {
 					error_idx = REQUEST_FILENAME_ERROR;
 					break;
@@ -375,14 +434,14 @@ static void* do_thread(void *thread_num) {
 // к имени файла приписывам соль, что бы имена не повторялись.
 // если поступят на обработку в одном и том же потоке два файла с одинаковым именем,
 // то отличаться они будут на соль
-// если и соль совпадет - это катастрофа всего миропорядка
+// если совпадут номер потока, имя файла и соль - это катастрофа всего миропорядка
 				for (i = 0; i < SALT_LEN; i++) {
 					salt = rand() % 256;
 					char2hex(t_pointer, (char*) &salt, sizeof(salt));
 					t_pointer += 2 * sizeof(salt);
 				}
 				memcpy(t_pointer, buf_current, buf_end - buf_current);
-
+// выделяем из запроса тип вложения
 				if ((buf_current = strcasestr(buf_start, "Content-Type: "))
 						== NULL) {
 					error_idx = REQUEST_CONTENTTYPE_ERROR;
@@ -392,7 +451,7 @@ static void* do_thread(void *thread_num) {
 // поиск закрывающего 0d 0a до конца buffer
 				buf_end = (char*) memchr(buf_current, 0x0d, batchRW);
 // имя файла и служебная информация заведомо поместятся в буфер
-// ну или должны поместиться
+// ну или должны поместиться. Так выбирали размер буфера для чтения
 
 				bzero(file_type, NAME_MAX);
 				if (buf_end - buf_current >= NAME_MAX
@@ -408,39 +467,61 @@ static void* do_thread(void *thread_num) {
 				}
 				buf_start = buf_end + 4;
 // 2 is fin boundary '--' 6 if first 2d2d2d2d2d2d
+// размер вложения включает длину файла и длину служебной информации
+// размер вложения без служебной информации и есть длина файла.
 				file_len = content_len - (buf_start - buffer) - strlen(boundary)
 						- 2 - 6;
 				done = file_len;
 // формат заголовка и его парсинг вызывают сомнения.
 // но библитеку такую не нашел, что бы сразу распарсить и файлы сохранить
+// почилось кривовато, работает, но наверно есть лучше решение
 
 // всё, что осталось в буфере это часть файла
+// который записываем в служебный, заранее открытый файл
 				batchRW = batchRW - (buf_start - buffer);
 // и по частям получаем из сокета данные и пишем в файл
 // длину получили заранее
 // если браузер прислал два и более файлов, то принимается только один.
+
+// если запись файла невозможна,значит нет места или мир рухнул
+// можно выйти по continue  и начать цикл обработки заново и ждать
+// пока не появится место
 				if (file_len <= batchRW) {
-					write(tmp_fd, buf_start, file_len);
+					ret = write(tmp_fd, buf_start, file_len);
 					done = 0;
 				} else {
-					write(tmp_fd, buf_start, batchRW);
+					ret = write(tmp_fd, buf_start, batchRW);
 					done -= batchRW;
 				}
+				if (ret < 0) {
+					error_idx = WRITE_FILE_EXEPTION;
+					break;
+					}
 				while (done > 0) {
 // вот тут следующий кусок файла получаем
 					batchRW = FCGX_GetStr(buffer, BUFLEN_F, request.in);
 					if (batchRW <= 0)
 						break;
 					if (done <= batchRW) {
-						write(tmp_fd, buffer, done);
+						ret = write(tmp_fd, buffer, done);
 						done = 0;
 						break;
 					} else {
-						write(tmp_fd, buffer, batchRW);
+						ret = write(tmp_fd, buffer, batchRW);
 						done -= batchRW;
 					}
+					if (ret < 0) {
+						error_idx = WRITE_FILE_EXEPTION;
+						break;
+						}
 				}
+				if (ret < 0) {
+					error_idx = WRITE_FILE_EXEPTION;
+					break;
+					}
+
 // вот тут файл получили, сохранили в папку data/images/ под рабочим названием
+// и можно его скормить напрмер OpenCV
 				close(tmp_fd);
 
 				bzero(file_path, PATH_MAX + NAME_MAX);
@@ -457,8 +538,8 @@ static void* do_thread(void *thread_num) {
 				}
 			} else {
 // если в fastCGI запросе нет вложений. Значит это ответ на вопрос.
-// в ответе содержится имя файла и значения параметров
-// можно извлечь и сохранить в файл marks
+// в ответе содержится имя файла, значения параметров и ответ на вопрос
+// Всё можно извлечь и сохранить в файл marks
 // и передать имя файла (а он в исходном виде сохранен) на новую обработку
 // тут можно еще проверок добавить разных и нужных
 				bzero(fcgi_txt, BUFLEN_TXT);
@@ -541,13 +622,19 @@ static void* do_thread(void *thread_num) {
 				error_idx = READ_FILE_EXEPTION;
 				continue;
 			}
-// маленькие файлы не обрабатываем
+// маленькие картинки не обрабатываем
+// к сожалению OpenCV файлы формата .heif
+// определяет как файлы с нулевой размерностью
+// поэтому размер файла и размер картинки это разные вещи
 			if (img_origin.rows < MIN_IMAGE_ROWS
 					or img_origin.cols <= MIN_IMAGE_COLS) {
 				error_idx = ERROR_IMAGE_ZERO_DIMENSION;
+// .heif not supported https://github.com/opencv/opencv/issues/14534
 				continue;
 			}
-// большие сжимаем
+// большие картинки сжимаем
+// можно добавить проверку MAX_IMAGE_ROWS и MAX_IMAGE_COLS
+// есди один из них равен 0, то ничего не делаем
 			if (img_origin.rows >= MAX_IMAGE_ROWS
 					or img_origin.cols >= MAX_IMAGE_COLS) {
 
@@ -561,9 +648,10 @@ static void* do_thread(void *thread_num) {
 				img_in = img_origin;
 
 // тут делаем несколько предварительных вычислений
-// эта часть исключительно как пример простого преобразования
+// эта часть исключительно простого преобразования
 // и тут как бы оптимизация вычислений
 // но компилятор скорее всего и сам много чего оптимизирует
+// и вынесет из циклов
 // и об этом нужно помнить всегда
 			col1 = float(img_in.cols - 1);
 			row1 = float(img_in.rows - 1);
@@ -574,7 +662,7 @@ static void* do_thread(void *thread_num) {
 // можно самому выделять очищать память,
 // может и переделаю попозже
 			Mat img_out(img_in.size(), img_in.type());
-// поскольку всё предбразование делается одной remap
+// поскольку всё преобразование делается через remap
 // то тут хранятся вычисляемые параметры
 			Mat map_r(img_in.size(), CV_32FC1);
 			Mat map_c(img_in.size(), CV_32FC1);
@@ -680,10 +768,20 @@ static void* do_thread(void *thread_num) {
 					asctime_r(&m_time, time_buf));
 
 // формируем команду ОС для передачи файла по назначению
-//
+// адрес 10.0.1.1 это адрес VPN сервера при обращении через VPN
+// по этому адресу наш FreeBSD сервер во внешнем мире
+// и картинка поедет дважды шифрованная
+// можно указать FRONT_ADDR и картинка будт отправлена на
+// сервер во внешнем мире другим путём.
+// на внешнем FreeBSD сервере можно порт SSH на FRONT_ADDR
+// совсем закрыть и сервер будет доступен только через VPN
 			bzero(exec_txt, BUFLEN_TXT);
 			sprintf(exec_txt,
-					"scp %s fun_house@10.0.1.1:/usr/local/www/data/images/%03d%.*s",
+					"scp %s funhouse@10.0.1.1:/usr/local/www/data/images/%03d%.*s",
+// 					"cp %s /var/www/html/images/%03d%.*s",
+// для локального использования или тестирования используем cp
+// если lighttpd запущен на этом же сервере, то можно и scp использовать
+// и cp для примера
 					out_file_path, thread_idx, (int) strlen(file_name),
 					file_name);
 // и отправляем файл через VPN на сервер в сети.
@@ -696,10 +794,10 @@ static void* do_thread(void *thread_num) {
 			}
 
 			bzero(fcgi_txt, BUFLEN_TXT);
-//начинает готовить HTML страницу
+// начинает готовить HTML страницу
 // готовим fcgi ответы в виде запросов
 // в тексте которых имя файла, параметры,соль и хеш
-// хеш конечно же нужно проверить потом
+// хеш конечно же можно проверить потом
 			t_pointer = fcgi_txt;
 			for (i = 0; i < PARAMETERS_NUM; i++) {
 				memcpy(t_pointer, &param[i], sizeof(param[i]));
@@ -717,7 +815,7 @@ static void* do_thread(void *thread_num) {
 					(size_t) (PARAMETERS_NUM * sizeof(param[ANGLE_1])
 							+ SALT_LEN * sizeof(salt) + strlen(file_name)),
 					md_buf);
-// fcgi запросы готовы и теперь строим HTML страницу
+// fcgi запросы-ответы на наши вопросы, готовы и теперь строим HTML страницу
 			bzero(html_txt, BUFLEN_TXT);
 			sprintf(html_txt + strlen(html_txt), "Status: 200 OK\r\n");
 			sprintf(html_txt + strlen(html_txt),
@@ -727,7 +825,7 @@ static void* do_thread(void *thread_num) {
 			sprintf(html_txt + strlen(html_txt),
 					"<html>\r\n<meta charset=\"utf-8\">\r\n");
 			sprintf(html_txt + strlen(html_txt), "<body>\r\n");
-// если картинка большая для показа, то сжимаем её средствами браузера
+// если картинка большая для показа, то указываем браузеру размер для сжатия
 			img_width =
 					img_out.cols > MAX_IMAGE_ROWS ?
 							MAX_IMAGE_ROWS : img_out.cols;
@@ -756,7 +854,7 @@ static void* do_thread(void *thread_num) {
 			sprintf(html_txt + strlen(html_txt),
 					"<p><button type=\"submit\" formaction=\"upload.html\"> ЕЩЕ КАРТИНКУ </button></p>\n");
 // если посетитель нажмет какую либо из кнопок
-// то fcgi запрос придет на вход этой пронраммы
+// то fcgi запрос придет на вход этой программы
 			sprintf(html_txt + strlen(html_txt), "</form>");
 			sprintf(html_txt + strlen(html_txt), "</body>\r\n</html>\r\n");
 
@@ -773,14 +871,14 @@ static void* do_thread(void *thread_num) {
 		if (error_idx != 0) {
 // если во время парсинга или скачивания или еще когда
 // возникла ошибка и мы это поняли,
-// то вот тут формируется переход на начальную страницу нашего сайта
+// то вот тут формируется страница перехода на начальную страницу нашего сайта
 			bzero(html_txt, BUFLEN_TXT);
 
 			sprintf(html_txt + strlen(html_txt),
 					"Status: 200 OK\r\nContent-Type: text/html\r\n\r\n");
 			sprintf(html_txt + strlen(html_txt), "<head>\n");
 			sprintf(html_txt + strlen(html_txt),
-					"<meta http-equiv=\"refresh\" content=\"0;URL=http://127.0.1.1/upload.html\"\n");
+					"<meta http-equiv=\"refresh\" content=\"0;URL=http://%s/upload.html\"\n", FRONT_ADDR);
 			sprintf(html_txt + strlen(html_txt), "</head>");
 			printf("%s\n", html_txt);
 			FCGX_PutS(html_txt, request.out);
@@ -791,7 +889,7 @@ static void* do_thread(void *thread_num) {
 			error_idx = 0;
 		}
 
-// все, что смоглм или что получилось показали и нужно
+// все, что смогли или что получилось показали и нужно
 //закрыть текущее соединение
 		FCGX_Finish_r(&request);
 
@@ -855,12 +953,16 @@ int main(void) {
 	fflush(log_file);
 
 // создаём рабочие потоки
+// номер потока хранится массиве
 	for (i = 0; i < THREAD_COUNT; i++) {
 		thread_num[i] = i;
 		pthread_create(&(id[i]), NULL, do_thread, &(thread_num[i]));
 	}
 
 // ждем завершения рабочих потоков
+// в данном варианте там бесконечный цикл
+// и поток может завершиться только по ошибке
+// ждем всех
 	for (i = 0; i < THREAD_COUNT; i++) {
 		pthread_join(id[i], NULL);
 		fprintf(log_file, "Thread %lu is joined\n", id[i]);
