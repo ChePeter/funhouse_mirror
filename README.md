@@ -1,4 +1,4 @@
-# fun_house_mirror
+# funhouse_mirror
 Искусственный интеллект лицом
 
 или 
