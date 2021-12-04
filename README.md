@@ -1,5 +1,7 @@
 # funhouse_mirror
-<meta name="google-site-verification" content="SdHmKR77gelQi6NWWNCqsgcJqNDpYq5k1_T_xTen2tw" />
+<head>
+      <meta name="google-site-verification" content="SdHmKR77gelQi6NWWNCqsgcJqNDpYq5k1_T_xTen2tw" />
+</head>
 Искусственный интеллект лицом
 
 или 
